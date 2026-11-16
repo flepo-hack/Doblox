@@ -1,31 +1,33 @@
 --[[
 	═══════════════════════════════════════════════════════════════════════
-	  NN ORBITER  ·  v2.0
-	  Kerää fyysisiä objekteja ympäriltäsi, kiertää ne pelaajan ympärillä
-	  ja ampuu ne maalia kohti.
+	  NN ORBITER  ·  v3.0   (network-ownership versio)
+	───────────────────────────────────────────────────────────────────────
+	  Ei poista mitään näkyvistä. Ei reparentointia. Ei feikki-/placebo-
+	  vahinkoa. Kaikki tapahtuu oikealla fysiikalla ja replikoituu muille.
 
-	  Ajetaan Roblox-executorissa (client-side). Skripti EI muokkaa pelin
-	  objektihierarkiaa: se ei uudelleenvanhempaa (reparent) osia eikä
-	  tuhoa pelin rakenteita – kierto ja ampuminen tehdään CFrame:llä.
+	  Toiminta:
+	    1. Ottaa NETWORK OWNERSHIPIN kartalta irrallaan oleviin esineisiin
+	       (SetNetworkOwner) → esine alkaa totella sinun clienttiäsi.
+	    2. Pyörittää ne sinun ympärilläsi (CFrame joka frame; omistajana
+	       clientti, joten muut näkevät saman).
+	    3. Kun klikkaat (puhelimen näyttö / hiiri), heittää ne kohti maalia.
+	    4. Kun heitetty esine osuu johonkin, se kerätään TAKAISIN
+	       kiertoradalle (ei jää lojumaan).
 
-	  Optimointi vs. v1.0:
-	    · tilakysely GetPartBoundsInRadius:lla  (O(lähellä olevat) eikä
-	      O(kaikki Workspacen lapset) joka frame)
-	    · skannaus on rajoitettu (scanInterval) eikä aja joka Heartbeat
-	    · objekteja ei uudelleenvanhempita → ei Instance-luontia per frame
-	    · enintään maxObjects objektia, dynaamiset liikkuvat osat ohitetaan
-	    · kunnollinen siivous: ei vuotavia liikkuja/instansseja
+	  Ei uudelleenvanhempaa: osat pysyvät alkuperäisessä paikassaan
+	  hierarkiassa, joten ne EIVÄT katoa näkyvistä. Vain CFrame liikkuu.
+
+	  Optimointi: GetPartBoundsInRadius (ei koko Workspace), rajoitettu
+	  skannaus, O(1)-indeksi, ei Instance-luontia per frame.
 	═══════════════════════════════════════════════════════════════════════
 ]]
 
 -- ═══════════════════════════════════════════════════════════════════════
 --  LOADSTRING-LATURI
---  Aja yhdellä rivillä:
 --      loadstring(game:HttpGet("https://raw.githubusercontent.com/flepo-hack/Doblox/main/Nn.lua"))()
---  Sisäänrakennettu API (executorin getgenv):
---      getgenv().NN_Load()      -- lataa & suorita tämä skripti uudelleen
---      getgenv().NN_Load(url)   -- lataa & suorita mikä tahansa URL
---      getgenv().NN_Unload()    -- sammuttaa ja siivoaa kaiken
+--  API (executorin getgenv):
+--      getgenv().NN_Load([url])   -- lataa & suorita
+--      getgenv().NN_Unload()      -- sammuttaa, palauttaa omistajuuden
 -- ═══════════════════════════════════════════════════════════════════════
 
 local GENV = (getgenv and getgenv()) or _G
@@ -62,51 +64,49 @@ function GENV.NN_Load(url)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
---  Palvelut & tila
+--  Palvelut & asetukset
 -- ═══════════════════════════════════════════════════════════════════════
 
-local Players     = game:GetService("Players")
-local RunService  = game:GetService("RunService")
-local Workspace   = game:GetService("Workspace")
-local UserInput   = game:GetService("UserInputService")
-local StarterGui  = game:GetService("StarterGui")
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace  = game:GetService("Workspace")
+local UserInput  = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
 
 local LocalPlayer = Players.LocalPlayer
 local Mouse       = LocalPlayer:GetMouse()
 
 local CONFIG = {
-	radius         = 28,    -- kuinka kaukaa objekteja kerätään
-	minDistance    = 5,     -- ei kerätä aivan ihossa kiinni olevia
-	orbitRadius    = 10,    -- kiertoradan säde
-	orbitHeight    = 5,     -- korkeus pelaajan yläpuolella
-	orbitSpeed     = 1.2,   -- rad/s
-	maxObjects     = 20,    -- kiertoradalla yhtä aikaa
-	scanInterval   = 0.25,  -- s skannausväli (ei joka frame)
-	shootSpeed     = 220,   -- studs/s ammuttaessa
-	projectileLife = 1.5,   -- s lentoaika ennen vapautusta
-	returnAfterShot= false, -- palaako objekti kiertoradalle osuman jälkeen
-	collectPlayers = false, -- kerää myös muiden hahmot
-	allowAnchored  = true,  -- kerää myös ankkuroidut osat
-	maxPartSize    = 24,    -- ohita suuremmat osat (esim. maa/baseplate)
-	maxModelParts  = 40,    -- ohita suuret mallit
+	radius         = 32,    -- kuinka kaukaa esineitä napataan
+	minDistance    = 4,     -- ei napata aivan ihossa kiinni olevia
+	orbitRadius    = 9,     -- kiertoradan säde
+	orbitHeight    = 4,     -- korkeus pelaajan yläpuolella
+	orbitSpeed     = 1.6,   -- rad/s
+	maxObjects     = 24,    -- montako yhtä aikaa kiertoradalla
+	scanInterval   = 0.2,   -- s skannausväli
+	throwSpeed     = 150,   -- studs/s heitossa
+	throwGravity   = 90,    -- keinotekoinen painovoima heitolle
+	recallRadius   = 3.5,   -- osumaetäisyys, jolla esine kerätään takaisin
+	allowAnchored  = true,  -- nappaa myös ankkuroidut osat
+	maxPartSize    = 30,    -- ohita suuremmat (baseplate/maa)
+	maxModelParts  = 40,    -- ohita isot mallit
+	collectPlayers = false, -- nappaa myös muiden hahmot
 	toggleKey      = Enum.KeyCode.RightShift,
-	damage         = 25,    -- client-side vahinko osumasta (ei aina replikoidu)
 }
 
 local state = {
 	running     = false,
 	collecting  = true,
-	list        = {},   -- järjestetty lista: { obj, isModel, anchored }
-	index       = {},   -- [instance] = record  (O(1)-jäsenyys)
-	projectiles = {},
+	list        = {},   -- { { obj=Instance, isModel=bool, anchored=bool } }
+	index       = {},   -- [instance] = record
+	thrown      = {},   -- lentävät esineet
 	angle       = 0,
 	scanClock   = 0,
 	connections = {},
-	tool        = nil,
 }
 
 -- ═══════════════════════════════════════════════════════════════════════
---  Apufunktiot
+--  Apurit
 -- ═══════════════════════════════════════════════════════════════════════
 
 local function getCharacter()
@@ -119,56 +119,55 @@ end
 
 local function notify(text)
 	pcall(function()
-		StarterGui:SetCore("SendNotification", { Title = "NN Orbiter", Text = text, Duration = 3 })
+		StarterGui:SetCore("SendNotification", { Title = "NN Orbiter", Text = text, Duration = 2.5 })
 	end)
 end
 
-local function removeFromList(rec)
+-- Palauttaa objektin hallinnan pelille (network ownership takaisin automaattiseksi).
+local function giveBackOwnership(rec)
+	local obj = rec.obj
+	if rec.anchored or not obj or not obj.Parent then return end
+	pcall(function()
+		if rec.isModel then
+			obj:SetNetworkOwnershipAuto()
+		else
+			obj:SetNetworkOwner(nil)
+		end
+	end)
+end
+
+-- Ottaa network ownershipin itselle (client).
+local function takeOwnership(rec)
+	local obj = rec.obj
+	if rec.anchored or not obj or not obj.Parent then return end
+	pcall(function()
+		if rec.isModel then
+			obj:SetNetworkOwner(LocalPlayer)
+		else
+			obj:SetNetworkOwner(LocalPlayer)
+		end
+	end)
+end
+
+local function releaseRecord(rec, restore)
+	if restore then giveBackOwnership(rec) end
+	state.index[rec.obj] = nil
 	for i = #state.list, 1, -1 do
 		if state.list[i] == rec then
 			table.remove(state.list, i)
-			return
+			break
 		end
 	end
 end
 
--- Vapauttaa objektin kiertoradalta (ei tuhoa pelin osia).
-local function release(rec, zeroVelocity)
-	local obj = rec.obj
-	state.index[obj] = nil
-	removeFromList(rec)
-	if zeroVelocity and not rec.anchored and obj and obj.Parent then
-		pcall(function() obj.AssemblyLinearVelocity = Vector3.zero end)
-	end
-end
-
 -- ═══════════════════════════════════════════════════════════════════════
---  Keräys – tilakysely rajoitetulla skannauksella
+--  Keräys (network ownership otetaan heti nappauksessa)
 -- ═══════════════════════════════════════════════════════════════════════
 
 local overlap = OverlapParams.new()
 overlap.FilterType = Enum.RaycastFilterType.Exclude or Enum.RaycastFilterType.Blacklist
 overlap.MaxParts = 400
 
-local function isCollectable(part, char, origin)
-	if typeof(part) ~= "Instance" or not part:IsA("BasePart") then return false end
-	if part:IsDescendantOf(char) then return false end
-	if state.index[part] then return false end
-
-	local model = part:FindFirstAncestorOfClass("Model")
-	if model and state.index[model] then return false end
-	if not CONFIG.collectPlayers and part:FindFirstAncestorOfClass("Humanoid") then return false end
-
-	local size = part.Size
-	if math.max(size.X, size.Y, size.Z) > CONFIG.maxPartSize then return false end
-	if not CONFIG.allowAnchored and part.Anchored then return false end
-
-	local d = (part.Position - origin).Magnitude
-	if d < CONFIG.minDistance or d > CONFIG.radius then return false end
-	return true
-end
-
--- Ryhmittelee osan mallikseen vain jos malli on järkevän kokoinen.
 local function groupOf(part)
 	local model = part.Parent
 	if model and model:IsA("Model") then
@@ -180,17 +179,34 @@ local function groupOf(part)
 	return part
 end
 
+local function isCollectable(part, char, origin)
+	if typeof(part) ~= "Instance" or not part:IsA("BasePart") then return false end
+	if part:IsDescendantOf(char) then return false end
+	if state.index[part] then return false end
+	if part:FindFirstAncestorOfClass("Humanoid") and not CONFIG.collectPlayers then return false end
+
+	local model = part:FindFirstAncestorOfClass("Model")
+	if model and state.index[model] then return false end
+
+	local size = part.Size
+	if math.max(size.X, size.Y, size.Z) > CONFIG.maxPartSize then return false end
+	if not CONFIG.allowAnchored and part.Anchored then return false end
+
+	local d = (part.Position - origin).Magnitude
+	if d < CONFIG.minDistance or d > CONFIG.radius then return false end
+	return true
+end
+
 local function register(part)
 	local group = groupOf(part)
 	if state.index[group] then return nil end
 
 	local rec = {
-		obj     = group,
-		isModel = group:IsA("Model"),
+		obj      = group,
+		isModel  = group:IsA("Model"),
 		anchored = part.Anchored,
 	}
 	if rec.isModel then
-		-- Malli on ankkuroitu vain jos kaikki sen osat ovat ankkuroituja.
 		rec.anchored = true
 		for _, c in ipairs(group:GetDescendants()) do
 			if c:IsA("BasePart") and not c.Anchored then
@@ -200,6 +216,7 @@ local function register(part)
 		end
 	end
 
+	takeOwnership(rec)
 	state.index[group] = rec
 	state.list[#state.list + 1] = rec
 	return rec
@@ -244,18 +261,16 @@ end
 --  Kierto
 -- ═══════════════════════════════════════════════════════════════════════
 
-local function placeObject(rec, targetPos, facePos)
-	local obj = rec.obj
-	local cf = CFrame.lookAt(targetPos, facePos)
+local function setCFrame(rec, cf)
 	if rec.isModel then
-		obj:PivotTo(cf)
+		rec.obj:PivotTo(cf)
 	else
-		obj.CFrame = cf
-		if not rec.anchored then
-			obj.AssemblyLinearVelocity = Vector3.zero
-			obj.AssemblyAngularVelocity = Vector3.zero
-		end
+		rec.obj.CFrame = cf
 	end
+end
+
+local function getPos(rec)
+	return rec.isModel and rec.obj:GetPivot().Position or rec.obj.Position
 end
 
 local function updateOrbit(dt)
@@ -270,13 +285,12 @@ local function updateOrbit(dt)
 	local step = (2 * math.pi) / n
 	local center = hrp.Position
 
-	-- Käännetty järjestys: release() voi poistaa alkion kesken silmukan,
-	-- jolloin eteenpäin iteroitaessa indeksi osoittaisi nil:iin.
+	-- Käännetty järjestys: releaseRecord voi poistaa alkion kesken silmukan.
 	for i = n, 1, -1 do
 		local rec = list[i]
 		local obj = rec.obj
 		if not obj or not obj.Parent then
-			release(rec, false)
+			releaseRecord(rec, false)
 		else
 			local a = state.angle + (i - 1) * step
 			local target = Vector3.new(
@@ -284,99 +298,101 @@ local function updateOrbit(dt)
 				center.Y + CONFIG.orbitHeight,
 				center.Z + CONFIG.orbitRadius * math.sin(a)
 			)
-			placeObject(rec, target, center)
+			setCFrame(rec, CFrame.lookAt(target, center))
 		end
 	end
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
---  Ampuminen
+--  Heitto & takaisinkeräys
 -- ═══════════════════════════════════════════════════════════════════════
 
-local function launch(rec, targetPos)
-	local obj = rec.obj
-	local pos = rec.isModel and obj:GetPivot().Position or obj.Position
-	local dir = targetPos - pos
-	if dir.Magnitude < 1e-4 then
-		dir = Vector3.new(0, 0, 1)
-	end
-	rec.vel = dir.Unit * CONFIG.shootSpeed
-	rec.life = CONFIG.projectileLife
-	state.projectiles[#state.projectiles + 1] = rec
-end
-
-local function shoot()
+local function throwAll()
 	local _, hrp = getCharacter()
 	if not hrp then return end
 	if #state.list == 0 then
-		notify("Ei ammuttavia objekteja.")
+		notify("Ei heitettäviä esineitä.")
 		return
 	end
 
-	local targetPos
 	local hit = Mouse.Hit
-	if hit then
-		targetPos = hit.Position
-	else
-		targetPos = hrp.Position + hrp.CFrame.LookVector * 100
-	end
+	local target = hit and hit.Position or (hrp.Position + hrp.CFrame.LookVector * 120)
 
-	-- Siirrä kaikki kiertoradalta ammuksiin.
 	local list = state.list
 	for i = #list, 1, -1 do
 		local rec = list[i]
 		state.index[rec.obj] = nil
 		table.remove(list, i)
-		launch(rec, targetPos)
+
+		local pos = getPos(rec)
+		local dir = target - pos
+		if dir.Magnitude < 1e-3 then
+			dir = hrp.CFrame.LookVector
+		end
+		rec.vel = dir.Unit * CONFIG.throwSpeed
+		rec.spin = Vector3.new(
+			(math.random() - 0.5) * 12,
+			(math.random() - 0.5) * 12,
+			(math.random() - 0.5) * 12
+		)
+		rec.rot = (rec.isModel and rec.obj:GetPivot().Rotation or rec.obj.CFrame.Rotation)
+		state.thrown[#state.thrown + 1] = rec
 	end
-	notify("Ammuttu!")
+	notify("Heitetty!")
 end
 
-local function damageIfHit(pos)
+-- Etsii lähimmän osumakohteen (muut pelaajat) heitetyn esineen ympäriltä.
+local function findHit(pos)
 	for _, p in ipairs(Players:GetPlayers()) do
 		if p ~= LocalPlayer and p.Character then
-			local h = p.Character:FindFirstChildOfClass("Humanoid")
 			local r = p.Character:FindFirstChild("HumanoidRootPart")
-			if h and r and (r.Position - pos).Magnitude < 4 then
-				pcall(function() h:TakeDamage(CONFIG.damage) end)
-				return true
+			local h = p.Character:FindFirstChildOfClass("Humanoid")
+			if r and h and h.Health > 0 and (r.Position - pos).Magnitude < CONFIG.recallRadius then
+				return p
 			end
 		end
 	end
-	return false
+	return nil
 end
 
-local function updateProjectiles(dt)
-	local list = state.projectiles
+-- Palauttaa heitetyn esineen kiertoradalle (rekisteröi uudelleen + ownership).
+local function recall(rec)
+	if not rec.obj or not rec.obj.Parent then return end
+	if #state.list >= CONFIG.maxObjects then
+		giveBackOwnership(rec)
+		return
+	end
+	takeOwnership(rec)
+	state.index[rec.obj] = rec
+	state.list[#state.list + 1] = rec
+end
+
+local function updateThrown(dt)
+	local list = state.thrown
 	for i = #list, 1, -1 do
 		local rec = list[i]
 		local obj = rec.obj
 		if not obj or not obj.Parent then
 			table.remove(list, i)
 		else
-			rec.life = rec.life - dt
-			local cur = rec.isModel and obj:GetPivot().Position or obj.Position
-			local nextPos = cur + rec.vel * dt
+			-- Painovoima + liike
+			rec.vel = rec.vel - Vector3.new(0, CONFIG.throwGravity * dt, 0)
+			local pos = getPos(rec) + rec.vel * dt
 
-			local rot = rec.isModel and obj:GetPivot().Rotation or obj.CFrame.Rotation
-			local cf = CFrame.new(nextPos) * rot
-			if rec.isModel then
-				obj:PivotTo(cf)
-			else
-				obj.CFrame = cf
-				if not rec.anchored then
-					obj.AssemblyLinearVelocity = Vector3.zero
-				end
-			end
+			rec.rot = rec.rot * CFrame.Angles(rec.spin.X * dt, rec.spin.Y * dt, rec.spin.Z * dt)
+			setCFrame(rec, CFrame.new(pos) * rec.rot)
 
-			damageIfHit(nextPos)
-
-			if rec.life <= 0 then
+			local hitPlayer = findHit(pos)
+			if hitPlayer then
+				-- Kerää takaisin kiertoradalle osuman jälkeen.
 				table.remove(list, i)
-				if CONFIG.returnAfterShot then
-					-- Palauta kiertoradalle.
-					state.index[obj] = rec
-					state.list[#state.list + 1] = rec
+				recall(rec)
+			else
+				-- Kerää takaisin myös jos palasi lähelle pelaajaa (ei jää kauas).
+				local _, hrp = getCharacter()
+				if hrp and (hrp.Position - pos).Magnitude < CONFIG.orbitRadius + 2 then
+					table.remove(list, i)
+					recall(rec)
 				end
 			end
 		end
@@ -384,42 +400,19 @@ local function updateProjectiles(dt)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
---  Työkalu
--- ═══════════════════════════════════════════════════════════════════════
-
-local function createTool()
-	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
-	if not backpack then return nil end
-
-	local tool = Instance.new("Tool")
-	tool.Name = "Shoot Orbiter"
-	tool.RequiresHandle = true
-	tool.CanBeDropped = false
-
-	local handle = Instance.new("Part")
-	handle.Name = "Handle"
-	handle.Size = Vector3.new(0.5, 0.5, 0.5)
-	handle.Transparency = 1
-	handle.CanCollide = false
-	handle.Massless = true
-	handle.Parent = tool
-
-	tool.Activated:Connect(shoot)
-	tool.Parent = backpack
-	return tool
-end
-
--- ═══════════════════════════════════════════════════════════════════════
 --  Elinkaari
 -- ═══════════════════════════════════════════════════════════════════════
 
-local function releaseAll(zeroVelocity)
+local function releaseAll()
 	for i = #state.list, 1, -1 do
-		release(state.list[i], zeroVelocity)
+		giveBackOwnership(state.list[i])
+	end
+	for i = #state.thrown, 1, -1 do
+		giveBackOwnership(state.thrown[i])
 	end
 	state.list = {}
 	state.index = {}
-	state.projectiles = {}
+	state.thrown = {}
 end
 
 local function onHeartbeat(dt)
@@ -434,7 +427,7 @@ local function onHeartbeat(dt)
 	end
 
 	updateOrbit(dt)
-	updateProjectiles(dt)
+	updateThrown(dt)
 end
 
 local function toggleCollecting()
@@ -451,50 +444,49 @@ function GENV.NN_Unload()
 	end
 	state.connections = {}
 
-	releaseAll(true)
-	if state.tool then
-		pcall(function() state.tool:Destroy() end)
-		state.tool = nil
-	end
-
+	releaseAll()
 	GENV.NN = nil
-	print("[NN] Sammutettu ja siivottu.")
+	print("[NN] Sammutettu – network ownership palautettu pelille.")
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+--  Syöte: klikkaus (puhelin = touch, PC = hiiri)
+-- ═══════════════════════════════════════════════════════════════════════
+
+local function onInputBegan(input, gpe)
+	if gpe then return end
+	if input.UserInputType == Enum.UserInputType.Touch
+		or input.UserInputType == Enum.UserInputType.MouseButton1 then
+		throwAll()
+	elseif input.KeyCode == CONFIG.toggleKey then
+		toggleCollecting()
+	end
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
 --  Käynnistys
 -- ═══════════════════════════════════════════════════════════════════════
 
--- Estä tuplakäynnistys (esim. NN_Load uudelleenlatauksen yhteydessä).
 if GENV.NN and GENV.NN.running then
 	GENV.NN_Unload()
 end
 
 state.running = true
-state.tool = createTool()
-
 state.connections[#state.connections + 1] = RunService.Heartbeat:Connect(onHeartbeat)
-
+state.connections[#state.connections + 1] = UserInput.InputBegan:Connect(onInputBegan)
 state.connections[#state.connections + 1] = LocalPlayer.CharacterRemoving:Connect(function()
-	releaseAll(true)
-end)
-
-state.connections[#state.connections + 1] = UserInput.InputBegan:Connect(function(input, gpe)
-	if gpe then return end
-	if input.KeyCode == CONFIG.toggleKey then
-		toggleCollecting()
-	end
+	releaseAll()
 end)
 
 GENV.NN = {
 	config  = CONFIG,
 	state   = state,
 	running = true,
-	shoot   = shoot,
+	throw   = throwAll,
 	toggle  = toggleCollecting,
 	unload  = GENV.NN_Unload,
 }
 
-print("[NN] Orbiter v2.0 ladattu. 'Shoot Orbiter' repussa – klikkaa ampuaksesi, "
-	.. tostring(CONFIG.toggleKey.Name) .. " vaihtaaksesi keräyksen.")
-notify("Ladattu! Klikkaa ampuaksesi (" .. tostring(CONFIG.toggleKey.Name) .. " = keräys)")
+print("[NN] Orbiter v3.0 (network ownership) ladattu. Klikkaa / napauta heittääksesi, "
+	.. tostring(CONFIG.toggleKey.Name) .. " = keräys.")
+notify("Ladattu! Klikkaa heittääksesi.")
